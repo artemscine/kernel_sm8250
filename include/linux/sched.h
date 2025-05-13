@@ -437,6 +437,9 @@ struct sched_avg {
 #define UTIL_EST_WEIGHT_SHIFT		2
 #define UTIL_AVG_UNCHANGED		0x80000000
 
+/* Scheduler time slice extension */
+extern unsigned int sysctl_sched_preempt_delay_us;
+
 struct sched_statistics {
 #ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;

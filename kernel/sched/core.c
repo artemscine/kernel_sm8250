@@ -44,6 +44,15 @@ const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
  */
 unsigned int sysctl_sched_rt_period = 1000000;
 
+/*
+ * Scheduler time slice extension, duration in microsecs.
+ * Max value allowed 100us, default is 30us.
+ * If set to 0, scheduler time slice extension is disabled.
+ */
+#define SCHED_PREEMPT_DELAY_DEFAULT_US	30
+__read_mostly unsigned int sysctl_sched_preempt_delay_us =
+	SCHED_PREEMPT_DELAY_DEFAULT_US;
+
 __read_mostly int scheduler_running;
 
 /*
@@ -3430,6 +3439,20 @@ int sysctl_schedstats(struct ctl_table *table, int write,
 #else  /* !CONFIG_SCHEDSTATS */
 static inline void init_schedstats(void) {}
 #endif /* CONFIG_SCHEDSTATS */
+
+static int sysctl_sched_preempt_delay(const struct ctl_table *table, int write,
+		void *buffer, size_t *lenp, loff_t *ppos)
+{
+	int err;
+
+	err = proc_dointvec_minmax((struct ctl_table *)table, write, buffer, lenp, ppos);
+	if (err < 0)
+		return err;
+	if (sysctl_sched_preempt_delay_us > SCHED_PREEMPT_DELAY_DEFAULT_US)
+		pr_warn("Sched preemption delay time set higher then default value %d us\n",
+			SCHED_PREEMPT_DELAY_DEFAULT_US);
+	return err;
+}
 
 /*
  * fork()/clone()-time setup:
