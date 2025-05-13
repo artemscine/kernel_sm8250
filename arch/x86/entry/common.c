@@ -149,8 +149,13 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
 		/* We have work to do. */
 		local_irq_enable();
 
-		if (cached_flags & _TIF_NEED_RESCHED)
-			schedule();
+		if (cached_flags & _TIF_NEED_RESCHED){
+			if (rseq_delay_resched()) {
+				clear_tsk_need_resched(current);
+			} else {
+				schedule();
+			}
+		}
 
 		if (cached_flags & _TIF_UPROBE)
 			uprobe_notify_resume(regs);
@@ -179,6 +184,11 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
 		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS))
 			break;
 	}
+	/*
+     * After all usermode preparation is done and no more work is pending,
+     * check if RSEQ delay resched was requested and finalize it.
+     */
+	rseq_delay_resched_fini();
 }
 
 /* Called with IRQs disabled. */

@@ -235,6 +235,8 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 
 	WARN_ON_ONCE(cpu_of(rq) != smp_processor_id());
 
+	rseq_delay_resched_tick();
+
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
 	rq->curr->sched_class->task_tick(rq, rq->curr, 1);
@@ -312,6 +314,17 @@ void hrtick_start(struct rq *rq, u64 delay)
 }
 
 #endif /* CONFIG_SMP */
+
+void hrtick_local_start(u64 delay)
+{
+	struct rq *rq = this_rq();
+	struct rq_flags rf;
+
+	rq_lock(rq, &rf);
+	hrtick_start(rq, delay);
+	rq_unlock(rq, &rf);
+}
+
 
 static void hrtick_rq_init(struct rq *rq)
 {
@@ -4708,6 +4721,8 @@ static void __sched notrace __schedule(bool preempt)
 	next = pick_next_task(rq, prev, &rf);
 	clear_tsk_need_resched(prev);
 	clear_preempt_need_resched();
+	if (IS_ENABLED(CONFIG_RSEQ))
+		prev->sched_time_delay = 0;
 #ifdef CONFIG_SCHED_WALT
 	wallclock = sched_ktime_clock();
 #endif
