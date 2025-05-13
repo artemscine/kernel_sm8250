@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/sched/task_stack.h>
+#include <trace/events/sched.h>
 #include <linux/mm.h>
 #include <linux/smp.h>
 #include <linux/errno.h>
@@ -138,6 +139,7 @@ static long syscall_trace_enter(struct pt_regs *regs)
 
 static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
 {
+	unsigned long ti_work_cleared = 0;
 	/*
 	 * In order to return to user mode, we need to have IRQs off with
 	 * none of EXIT_TO_USERMODE_LOOP_FLAGS set.  Several of these flags
@@ -152,6 +154,7 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
 		if (cached_flags & _TIF_NEED_RESCHED){
 			if (rseq_delay_resched()) {
 				clear_tsk_need_resched(current);
+				ti_work_cleared = ti_work;
 			} else {
 				schedule();
 			}
@@ -184,6 +187,10 @@ static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
 		if (!(cached_flags & EXIT_TO_USERMODE_LOOP_FLAGS))
 			break;
 	}
+
+	if (ti_work_cleared)
+		trace_sched_delay_resched(current, ti_work_cleared & (_TIF_NEED_RESCHED));
+
 	/*
      * After all usermode preparation is done and no more work is pending,
      * check if RSEQ delay resched was requested and finalize it.
