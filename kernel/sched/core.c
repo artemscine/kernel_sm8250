@@ -4721,8 +4721,7 @@ static void __sched notrace __schedule(bool preempt)
 	next = pick_next_task(rq, prev, &rf);
 	clear_tsk_need_resched(prev);
 	clear_preempt_need_resched();
-	if (IS_ENABLED(CONFIG_RSEQ))
-		prev->sched_time_delay = 0;
+	rseq_delay_schedule();
 #ifdef CONFIG_SCHED_WALT
 	wallclock = sched_ktime_clock();
 #endif

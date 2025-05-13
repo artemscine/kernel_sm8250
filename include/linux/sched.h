@@ -2064,12 +2064,14 @@ static inline void set_task_cpu(struct task_struct *p, unsigned int cpu)
 extern bool rseq_delay_resched(void);
 extern void rseq_delay_resched_fini(void);
 extern void rseq_delay_resched_tick(void);
+extern void rseq_delay_schedule(void);
 
 #else
 
 static inline bool rseq_delay_resched(void) { return false; }
 static inline void rseq_delay_resched_fini(void) { }
 static inline void rseq_delay_resched_tick(void) { }
+static inline void rseq_delay_schedule(void) { }
 
 #endif
 
