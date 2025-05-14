@@ -8,6 +8,7 @@
 #include <linux/lrng.h>
 
 #include "sched.h"
+#include <linux/sysctl.h>
 
 #include <linux/nospec.h>
 
@@ -43,6 +44,23 @@ const_debug unsigned int sysctl_sched_nr_migrate = SCHED_NR_MIGRATE_BREAK;
  * default: 1s
  */
 unsigned int sysctl_sched_rt_period = 1000000;
+
+static int zero __read_mostly;
+static int one_hundred __read_mostly = 100;
+
+static struct ctl_table sched_delay_table[] = {
+    {
+        .procname	= "sched_preempt_delay_us",
+        .data		= &sysctl_sched_preempt_delay_us,
+        .maxlen		= sizeof(unsigned int),
+        .mode		= 0644,
+        .proc_handler	= sysctl_sched_preempt_delay,
+        .extra1		= &zero,
+        .extra2		= &one_hundred,
+    },
+    { }  /* Terminating empty entry */
+};
+static struct ctl_table_header *sched_delay_sysctl_table;
 
 /*
  * Scheduler time slice extension, duration in microsecs.
@@ -7586,6 +7604,10 @@ void __init sched_init(void)
 	init_uclamp();
 
 	scheduler_running = 1;
+
+    sched_delay_sysctl_table = register_sysctl("kernel", sched_delay_table);
+    if (!sched_delay_sysctl_table)
+        pr_warn("Failed to register sched_preempt_delay_us sysctl\n");
 
 	cpumask_clear(&min_cap_cpu_mask);
 }
