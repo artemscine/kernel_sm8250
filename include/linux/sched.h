@@ -440,6 +440,11 @@ struct sched_avg {
 /* Scheduler time slice extension */
 extern unsigned int sysctl_sched_preempt_delay_us;
 
+#ifdef CONFIG_SYSCTL
+extern int sysctl_sched_preempt_delay(struct ctl_table *table, int write,
+                     void *buffer, size_t *lenp, loff_t *ppos);
+#endif
+
 struct sched_statistics {
 #ifdef CONFIG_SCHEDSTATS
 	u64				wait_start;

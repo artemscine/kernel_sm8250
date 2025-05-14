@@ -3458,7 +3458,7 @@ int sysctl_schedstats(struct ctl_table *table, int write,
 static inline void init_schedstats(void) {}
 #endif /* CONFIG_SCHEDSTATS */
 
-static int sysctl_sched_preempt_delay(const struct ctl_table *table, int write,
+int sysctl_sched_preempt_delay(struct ctl_table *table, int write,
 		void *buffer, size_t *lenp, loff_t *ppos)
 {
 	int err;
