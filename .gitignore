@@ -140,3 +140,6 @@ kernel/configs/android-*.cfg
 #techpack/
 out/
 build.sh
+
+# Rebase
+*.orig
