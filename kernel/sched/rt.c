@@ -9,8 +9,6 @@
 
 #include <trace/events/sched.h>
 
-#include "walt.h"
-
 int sched_rr_timeslice = RR_TIMESLICE;
 int sysctl_sched_rr_timeslice = (MSEC_PER_SEC * RR_TIMESLICE) / HZ;
 
@@ -795,7 +793,7 @@ static void __disable_runtime(struct rq *rq)
 		 * We cannot be left wanting - that would mean some runtime
 		 * leaked out of the system.
 		 */
-		BUG_ON(want);
+		WARN_ON_ONCE(want);
 balanced:
 		/*
 		 * Disable all the borrow logic by pretending we have inf
@@ -997,25 +995,14 @@ static void update_curr_rt(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 	struct sched_rt_entity *rt_se = &curr->rt;
-	u64 delta_exec;
-	u64 now;
+	s64 delta_exec;
 
 	if (curr->sched_class != &rt_sched_class)
 		return;
 
-	now = rq_clock_task(rq);
-	delta_exec = now - curr->se.exec_start;
-	if (unlikely((s64)delta_exec <= 0))
+	delta_exec = update_curr_common(rq);
+	if (unlikely(delta_exec <= 0))
 		return;
-
-	schedstat_set(curr->se.statistics.exec_max,
-		      max(curr->se.statistics.exec_max, delta_exec));
-
-	curr->se.sum_exec_runtime += delta_exec;
-	account_group_exec_runtime(curr, delta_exec);
-
-	curr->se.exec_start = now;
-	cgroup_account_cputime(curr, delta_exec);
 
 	if (!rt_bandwidth_enabled())
 		return;
@@ -1401,8 +1388,6 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_rt_entity *rt_se = &p->rt;
 	bool sync = !!(flags & ENQUEUE_WAKEUP_SYNC);
 
-	schedtune_enqueue_task(p, cpu_of(rq));
-
 	if (flags & ENQUEUE_WAKEUP)
 		rt_se->timeout = 0;
 
@@ -1416,8 +1401,6 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
-
-	schedtune_dequeue_task(p, cpu_of(rq));
 
 	update_curr_rt(rq);
 	dequeue_rt_entity(rt_se, flags);
@@ -1491,12 +1474,7 @@ static bool rt_task_fits_cpu(struct task_struct *p, int cpu)
 }
 
 static int
-#ifdef CONFIG_SCHED_WALT
-select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags,
-		 int sibling_count_hint)
-#else
 select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
-#endif
 {
 	struct task_struct *curr;
 	struct rq *rq;
@@ -2570,9 +2548,6 @@ const struct sched_class rt_sched_class = {
 	.switched_to		= switched_to_rt,
 
 	.update_curr		= update_curr_rt,
-#ifdef CONFIG_SCHED_WALT
-	.fixup_walt_sched_stats	= fixup_walt_sched_stats_common,
-#endif
 
 #ifdef CONFIG_UCLAMP_TASK
 	.uclamp_enabled		= 1,

@@ -615,13 +615,8 @@
 		 goto destroy_compress_ctx;
 	 }
  
-	 for (i = 0; i < cc->nr_cpages; i++) {
+	 for (i = 0; i < cc->nr_cpages; i++)
 		 cc->cpages[i] = f2fs_compress_alloc_page();
-		 if (!cc->cpages[i]) {
-			 ret = -ENOMEM;
-			 goto out_free_cpages;
-		 }
-	 }
  
 	 cc->rbuf = f2fs_vmap(cc->rpages, cc->cluster_size);
 	 if (!cc->rbuf) {
@@ -1203,6 +1198,7 @@
 	 unsigned int last_index = cc->cluster_size - 1;
 	 loff_t psize;
 	 int i, err;
+	 bool quota_inode = IS_NOQUOTA(inode);
  
 	 /* we should bypass data pages to proceed the kworkder jobs */
 	 if (unlikely(f2fs_cp_error(sbi))) {
@@ -1210,7 +1206,7 @@
 		 goto out_free;
 	 }
  
-	 if (IS_NOQUOTA(inode)) {
+	 if (quota_inode) {
 		 /*
 		  * We need to wait for node_write to avoid block allocation during
 		  * checkpoint. This can only happen to quota writes which can cause
@@ -1332,7 +1328,7 @@
 		 set_inode_flag(inode, FI_FIRST_BLOCK_WRITTEN);
  
 	 f2fs_put_dnode(&dn);
-	 if (IS_NOQUOTA(inode))
+	 if (quota_inode)
 		 f2fs_up_read(&sbi->node_write);
 	 else
 		 f2fs_unlock_op(sbi);
@@ -1358,7 +1354,7 @@
  out_put_dnode:
 	 f2fs_put_dnode(&dn);
  out_unlock_op:
-	 if (IS_NOQUOTA(inode))
+	 if (quota_inode)
 		 f2fs_up_read(&sbi->node_write);
 	 else
 		 f2fs_unlock_op(sbi);
@@ -1529,8 +1525,6 @@
 		 }
  
 		 dic->tpages[i] = f2fs_compress_alloc_page();
-		 if (!dic->tpages[i])
-			 return -ENOMEM;
 	 }
  
 	 dic->rbuf = f2fs_vmap(dic->tpages, dic->cluster_size);
@@ -1611,10 +1605,6 @@
 		 struct page *page;
  
 		 page = f2fs_compress_alloc_page();
-		 if (!page) {
-			 ret = -ENOMEM;
-			 goto out_free;
-		 }
  
 		 f2fs_set_compressed_page(page, cc->inode,
 					 start_idx + i + 1, dic);
