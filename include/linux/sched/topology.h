@@ -26,6 +26,7 @@
 #define SD_PREFER_SIBLING	0x0800	/* Prefer to place tasks in a sibling domain */
 #define SD_OVERLAP		0x1000	/* sched_domains of this level overlap */
 #define SD_NUMA			0x2000	/* cross-node balancing */
+#define SD_ASYM_CPUCAPACITY_FULL 0x4000 /* Domain members have different CPU capacities spanning all unique CPU capacity values */
 
 #ifdef CONFIG_SCHED_SMT
 static inline int cpu_smt_flags(void)
@@ -159,10 +160,6 @@ static inline struct cpumask *sched_domain_span(struct sched_domain *sd)
 	return to_cpumask(sd->span);
 }
 
-extern void partition_sched_domains_locked(int ndoms_new,
-					   cpumask_var_t doms_new[],
-					   struct sched_domain_attr *dattr_new);
-
 extern void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 				    struct sched_domain_attr *dattr_new);
 
@@ -206,12 +203,6 @@ extern void set_sched_topology(struct sched_domain_topology_level *tl);
 #else /* CONFIG_SMP */
 
 struct sched_domain_attr;
-
-static inline void
-partition_sched_domains_locked(int ndoms_new, cpumask_var_t doms_new[],
-			       struct sched_domain_attr *dattr_new)
-{
-}
 
 static inline void
 partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],

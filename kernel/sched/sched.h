@@ -970,7 +970,6 @@ struct rq {
 #endif
 #ifdef CONFIG_NO_HZ_COMMON
 #ifdef CONFIG_SMP
-	unsigned long		last_load_update_tick;
 	unsigned long		last_blocked_load_update_tick;
 	unsigned int		has_blocked_load;
 	call_single_data_t	nohz_csd;
@@ -1700,6 +1699,7 @@ static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 	set_task_rq_fair(&p->se, p->se.cfs_rq, tg->cfs_rq[cpu]);
 	p->se.cfs_rq = tg->cfs_rq[cpu];
 	p->se.parent = tg->se[cpu];
+	p->se.depth = tg->se[cpu] ? tg->se[cpu]->depth + 1 : 0;
 #endif
 
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1857,8 +1857,6 @@ extern const u32		sched_prio_to_wmult[40];
 
 #define RETRY_TASK		((void *)-1UL)
 
-extern s64 update_curr_common(struct rq *rq);
-
 struct sched_class {
 	const struct sched_class *next;
 
@@ -1913,11 +1911,8 @@ struct sched_class {
 
 	void (*update_curr)(struct rq *rq);
 
-#define TASK_SET_GROUP		0
-#define TASK_MOVE_GROUP		1
-
 #ifdef CONFIG_FAIR_GROUP_SCHED
-	void (*task_change_group)(struct task_struct *p, int type);
+	void (*task_change_group)(struct task_struct *p);
 #endif
 
 };
@@ -2084,12 +2079,12 @@ static inline void add_nr_running(struct rq *rq, unsigned count)
 
 	rq->nr_running = prev_nr + count;
 
-	if (prev_nr < 2 && rq->nr_running >= 2) {
 #ifdef CONFIG_SMP
+	if (prev_nr < 2 && rq->nr_running >= 2) {
 		if (!READ_ONCE(rq->rd->overload))
 			WRITE_ONCE(rq->rd->overload, 1);
-#endif
 	}
+#endif
 
 	sched_update_tick_dependency(rq);
 }
@@ -3012,12 +3007,6 @@ struct sched_avg_stats {
 	int nr_max;
 	int nr_scaled;
 };
-
-static inline unsigned int cfs_h_nr_delayed(struct rq *rq)
-{
-	return (rq->cfs.h_nr_running - rq->cfs.h_nr_runnable);
-}
-
 extern void sched_get_nr_running_avg(struct sched_avg_stats *stats);
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);

@@ -1596,7 +1596,7 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 		update_rq_clock(rq);
 
 	if (!(flags & ENQUEUE_RESTORE)) {
-		sched_info_enqueue(rq, p);
+		sched_info_queued(rq, p);
 		psi_enqueue(p, flags & ENQUEUE_WAKEUP);
 	}
 
@@ -1620,7 +1620,7 @@ inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 		update_rq_clock(rq);
 
 	if (!(flags & DEQUEUE_SAVE)) {
-		sched_info_dequeue(rq, p);
+		sched_info_dequeued(rq, p);
 		psi_dequeue(p, flags & DEQUEUE_SLEEP);
 	}
 
@@ -2769,8 +2769,7 @@ static inline bool ttwu_queue_cond(int cpu, int wake_flags)
 	 * the soon-to-be-idle CPU as the current CPU is likely busy.
 	 * nr_running is checked to avoid unnecessary task stacking.
 	 */
-	if ((wake_flags & WF_ON_RQ) && 
-		(cpu_rq(cpu)->nr_running - cfs_h_nr_delayed(cpu_rq(cpu))) <= 1)
+	if ((wake_flags & WF_ON_RQ) && cpu_rq(cpu)->nr_running <= 1)
 		return true;
 
 	return false;
@@ -3165,8 +3164,7 @@ int wake_up_state(struct task_struct *p, unsigned int state)
  * Perform scheduler related setup for a newly forked process p.
  * p is forked by current.
  *
- * __sched_fork() is basic setup which is also used by sched_init() to
- * initialize the boot CPU's idle task.
+ * __sched_fork() is basic setup used by init_idle() too:
  */
 static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
@@ -3334,8 +3332,6 @@ static inline void init_schedstats(void) {}
  */
 int sched_fork(unsigned long clone_flags, struct task_struct *p)
 {
-	unsigned long flags;
-
 	__sched_fork(clone_flags, p);
 	/*
 	 * We mark the process as NEW here. This guarantees that
@@ -3383,24 +3379,6 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 	init_entity_runnable_average(&p->se);
 
-	/*
-	 * The child is not yet in the pid-hash so no cgroup attach races,
-	 * and the cgroup is pinned to this child due to cgroup_fork()
-	 * is ran before sched_fork().
-	 *
-	 * Silence PROVE_RCU.
-	 */
-	raw_spin_lock_irqsave(&p->pi_lock, flags);
-	rseq_migrate(p);
-	/*
-	 * We're setting the CPU for the first time, we don't migrate,
-	 * so use __set_task_cpu().
-	 */
-	__set_task_cpu(p, smp_processor_id());
-	if (p->sched_class->task_fork)
-		p->sched_class->task_fork(p);
-	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
-
 #ifdef CONFIG_SCHED_INFO
 	if (likely(sched_info_on()))
 		memset(&p->sched_info, 0, sizeof(p->sched_info));
@@ -3414,6 +3392,35 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 	RB_CLEAR_NODE(&p->pushable_dl_tasks);
 #endif
 	return 0;
+}
+
+void sched_cgroup_fork(struct task_struct *p)
+{
+	unsigned long flags;
+
+	/*
+	 * Because we're not yet on the pid-hash, p->pi_lock isn't strictly
+	 * required yet, but lockdep gets upset if rules are violated.
+	 */
+	raw_spin_lock_irqsave(&p->pi_lock, flags);
+#ifdef CONFIG_CGROUP_SCHED
+	if (1) {
+		struct task_group *tg;
+		tg = container_of(task_css_check(p, cpu_cgrp_id, true),
+				  struct task_group, css);
+		tg = autogroup_task_group(p, tg);
+		p->sched_task_group = tg;
+	}
+#endif
+	rseq_migrate(p);
+	/*
+	 * We're setting the CPU for the first time, we don't migrate,
+	 * so use __set_task_cpu().
+	 */
+	__set_task_cpu(p, smp_processor_id());
+	if (p->sched_class->task_fork)
+		p->sched_class->task_fork(p);
+	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 }
 
 void sched_post_fork(struct task_struct *p)
@@ -5435,8 +5442,8 @@ recheck:
 	 * Changing the policy of the stop threads its a very bad idea:
 	 */
 	if (p == rq->stop) {
-		retval = -EINVAL;
-		goto unlock;
+		task_rq_unlock(rq, p, &rf);
+		return -EINVAL;
 	}
 
 	/*
@@ -5456,8 +5463,8 @@ recheck:
 			goto change;
 
 		p->sched_reset_on_fork = reset_on_fork;
-		retval = 0;
-		goto unlock;
+		task_rq_unlock(rq, p, &rf);
+		return 0;
 	}
 change:
 
@@ -5470,8 +5477,8 @@ change:
 		if (rt_bandwidth_enabled() && rt_policy(policy) &&
 				task_group(p)->rt_bandwidth.rt_runtime == 0 &&
 				!task_group_is_autogroup(task_group(p))) {
-			retval = -EPERM;
-			goto unlock;
+			task_rq_unlock(rq, p, &rf);
+			return -EPERM;
 		}
 #endif
 #ifdef CONFIG_SMP
@@ -5486,8 +5493,8 @@ change:
 			 */
 			if (!cpumask_subset(span, &p->cpus_allowed) ||
 			    rq->rd->dl_bw.bw == 0) {
-				retval = -EPERM;
-				goto unlock;
+				task_rq_unlock(rq, p, &rf);
+				return -EPERM;
 			}
 		}
 #endif
@@ -5506,8 +5513,8 @@ change:
 	 * is available.
 	 */
 	if ((dl_policy(policy) || dl_task(p)) && sched_dl_overflow(p, policy, attr)) {
-		retval = -EBUSY;
-		goto unlock;
+		task_rq_unlock(rq, p, &rf);
+		return -EBUSY;
 	}
 
 	p->sched_reset_on_fork = reset_on_fork;
@@ -5574,10 +5581,6 @@ change:
 	preempt_enable();
 
 	return 0;
-
-unlock:
-	task_rq_unlock(rq, p, &rf);
-	return retval;
 }
 
 static int _sched_setscheduler(struct task_struct *p, int policy,
@@ -6705,6 +6708,8 @@ void init_idle(struct task_struct *idle, int cpu)
 	struct rq *rq = cpu_rq(cpu);
 	unsigned long flags;
 
+	__sched_fork(0, idle);
+
 	raw_spin_lock_irqsave(&idle->pi_lock, flags);
 	raw_spin_lock(&rq->lock);
 
@@ -6717,8 +6722,10 @@ void init_idle(struct task_struct *idle, int cpu)
 
 #ifdef CONFIG_SMP
 	/*
-	 * No validation and serialization required at boot time and for
-	 * setting up the idle tasks of not yet online CPUs.
+	 * Its possible that init_idle() gets called multiple times on a task,
+	 * in that case do_set_cpus_allowed() will not do the right thing.
+	 *
+	 * And since this is boot we can forgo the serialization.
 	 */
 	set_cpus_allowed_common(idle, cpumask_of(cpu));
 #endif
@@ -7106,8 +7113,6 @@ int sched_cpu_activate(unsigned int cpu)
 	}
 	rq_unlock_irqrestore(rq, &rf);
 
-	update_max_interval();
-
 	return 0;
 }
 
@@ -7278,8 +7283,6 @@ void __init sched_init(void)
 		root_task_group.cfs_rq = (struct cfs_rq **)ptr;
 		ptr += nr_cpu_ids * sizeof(void **);
 
-		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
-		init_cfs_bandwidth(&root_task_group.cfs_bandwidth);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 #ifdef CONFIG_RT_GROUP_SCHED
 		root_task_group.rt_se = (struct sched_rt_entity **)ptr;
@@ -7331,6 +7334,7 @@ void __init sched_init(void)
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
 #ifdef CONFIG_FAIR_GROUP_SCHED
+		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
 		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
 		/*
@@ -7352,6 +7356,7 @@ void __init sched_init(void)
 		 * We achieve this by letting root_task_group's tasks sit
 		 * directly in rq->cfs (i.e root_task_group->se[] = NULL).
 		 */
+		init_cfs_bandwidth(&root_task_group.cfs_bandwidth);
 		init_tg_cfs_entry(&root_task_group, &rq->cfs, NULL, i, NULL);
 #endif /* CONFIG_FAIR_GROUP_SCHED */
 
@@ -7379,7 +7384,6 @@ void __init sched_init(void)
 
 		rq_attach_root(rq, &def_root_domain);
 #ifdef CONFIG_NO_HZ_COMMON
-		rq->last_load_update_tick = jiffies;
 		rq->last_blocked_load_update_tick = jiffies;
 		atomic_set(&rq->nohz_flags, 0);
 
@@ -7405,7 +7409,6 @@ void __init sched_init(void)
 	 * but because we are the idle thread, we just pick up running again
 	 * when this runqueue becomes "idle".
 	 */
-	__sched_fork(0, current);
 	init_idle(current, smp_processor_id());
 
 	calc_load_update = jiffies + LOAD_FREQ;
@@ -7707,7 +7710,7 @@ void sched_release_group(struct task_group *tg)
 	spin_unlock_irqrestore(&task_group_lock, flags);
 }
 
-static void sched_change_group(struct task_struct *tsk, int type)
+static struct task_group *sched_get_task_group(struct task_struct *tsk)
 {
 	struct task_group *tg;
 
@@ -7719,11 +7722,17 @@ static void sched_change_group(struct task_struct *tsk, int type)
 	tg = container_of(task_css_check(tsk, cpu_cgrp_id, true),
 			  struct task_group, css);
 	tg = autogroup_task_group(tsk, tg);
-	tsk->sched_task_group = tg;
+
+	return tg;
+}
+
+static void sched_change_group(struct task_struct *tsk, struct task_group *group)
+{
+	tsk->sched_task_group = group;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (tsk->sched_class->task_change_group)
-		tsk->sched_class->task_change_group(tsk, type);
+		tsk->sched_class->task_change_group(tsk);
 	else
 #endif
 		set_task_rq(tsk, task_cpu(tsk));
@@ -7740,10 +7749,19 @@ void sched_move_task(struct task_struct *tsk)
 {
 	int queued, running, queue_flags =
 		DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+	struct task_group *group;
 	struct rq_flags rf;
 	struct rq *rq;
 
 	rq = task_rq_lock(tsk, &rf);
+	/*
+	 * Esp. with SCHED_AUTOGROUP enabled it is possible to get superfluous
+	 * group changes.
+	 */
+	group = sched_get_task_group(tsk);
+	if (group == tsk->sched_task_group)
+		goto unlock;
+
 	update_rq_clock(rq);
 
 	running = task_current(rq, tsk);
@@ -7754,7 +7772,7 @@ void sched_move_task(struct task_struct *tsk)
 	if (running)
 		put_prev_task(rq, tsk);
 
-	sched_change_group(tsk, TASK_MOVE_GROUP);
+	sched_change_group(tsk, group);
 
 	if (queued)
 		enqueue_task(rq, tsk, queue_flags);
@@ -7768,6 +7786,7 @@ void sched_move_task(struct task_struct *tsk)
 		resched_curr(rq);
 	}
 
+unlock:
 	task_rq_unlock(rq, tsk, &rf);
 }
 
@@ -7837,23 +7856,6 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
 	sched_unregister_group(tg);
-}
-
-/*
- * This is called before wake_up_new_task(), therefore we really only
- * have to set its group bits, all the other stuff does not apply.
- */
-static void cpu_cgroup_fork(struct task_struct *task)
-{
-	struct rq_flags rf;
-	struct rq *rq;
-
-	rq = task_rq_lock(task, &rf);
-
-	update_rq_clock(rq);
-	sched_change_group(task, TASK_SET_GROUP);
-
-	task_rq_unlock(rq, task, &rf);
 }
 
 static int cpu_cgroup_can_attach(struct cgroup_taskset *tset)
@@ -8733,7 +8735,6 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.css_released	= cpu_cgroup_css_released,
 	.css_free	= cpu_cgroup_css_free,
 	.css_extra_stat_show = cpu_extra_stat_show,
-	.fork		= cpu_cgroup_fork,
 	.can_attach	= cpu_cgroup_can_attach,
 	.attach		= cpu_cgroup_attach,
 	.legacy_cftypes	= cpu_legacy_files,

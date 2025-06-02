@@ -451,7 +451,7 @@ struct sched_statistics {
 
 	u64				block_start;
 	u64				block_max;
-	s64				exec_max;
+	u64				exec_max;
 	u64				slice_max;
 
 	u64				nr_migrations_cold;
@@ -890,6 +890,10 @@ struct task_struct {
 #ifdef CONFIG_BLK_CGROUP
 	/* to be used once the psi infrastructure lands upstream. */
 	unsigned			use_memdelay:1;
+#endif
+#ifdef CONFIG_EVENTFD
+	/* Recursion prevention for eventfd_signal() */
+	unsigned			in_eventfd_signal:1;
 #endif
 
 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
