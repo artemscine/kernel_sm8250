@@ -116,6 +116,10 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 		return true;
 	}
 
+	/* If the last frequency wasn't set yet then we can still amend it */
+	if (sg_policy->work_in_progress)
+		return true;
+
 	/*
 	 * When frequency-invariant utilization tracking is present, there's no
 	 * rate limit when increasing frequency. Therefore, the next frequency
@@ -363,6 +367,7 @@ unsigned long calculate_headroom_low(unsigned long headroom, int cpu, unsigned l
 	if (util <= sysctl_util_low) { // check if util is way too high for decreasing headroom
 		if (cpumask_test_cpu(cpu, cpu_prime_mask))
 			return (util >> 3); // we want to reduce headroom of prime cluster if phone is idling with screen on
+		else
 			return (fps > sysctl_fps_threshold_high) ? (util - (util >> 1)) :
 			(fps < sysctl_fps_threshold_low) ? (util >> 3) :
 			(util >> 2);
@@ -375,17 +380,22 @@ static __always_inline
 unsigned long apply_dvfs_headroom(int cpu, unsigned long util, unsigned long max_cap)
 {
 	unsigned long headroom = util;
+	int fps;
 	unsigned int refresh_rate = dsi_panel_get_refresh_rate();
-	int fps = msm_panel_fps;
+	if (!refresh_rate)
+		refresh_rate = 60;
+
+	fps = msm_panel_fps ?: 30;
 
 	if (!util || util >= max_cap)
 		return util;
 
-	if (refresh_rate > 60)
+	if (refresh_rate > 60 && fps > 70)
 		headroom = calculate_headroom_high(headroom, cpu, util);
 	else
 		headroom = calculate_headroom_low(headroom, cpu, util, fps);
 
+	headroom = min(headroom, max_cap);
 	return headroom;
 }
 
@@ -863,7 +873,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	tunables->rate_limit_us = 1000;
+	tunables->rate_limit_us = 2000;
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;

@@ -3268,44 +3268,7 @@ static inline void zone_statistics(struct zone *preferred_zone, struct zone *z)
 #endif
 }
 
-#ifdef CONFIG_CMA
-/*
- * GFP_MOVABLE allocation could drain UNMOVABLE & RECLAIMABLE page blocks via
- * the help of CMA which makes GFP_KERNEL failed. Checking if zone_watermark_ok
- * again without ALLOC_CMA to see if to use CMA first.
- */
-static bool use_cma_first(struct zone *zone, unsigned int order, unsigned int alloc_flags)
-{
-	unsigned long watermark;
-	bool cma_first = false;
-
-	watermark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
-	/* check if GFP_MOVABLE pass previous zone_watermark_ok via the help of CMA */
-	if (zone_watermark_ok(zone, order, watermark, 0, alloc_flags & (~ALLOC_CMA))) {
-		/*
-		 * Balance movable allocations between regular and CMA areas by
-		 * allocating from CMA when over half of the zone's free memory
-		 * is in the CMA area.
-		 */
-		cma_first = (zone_page_state(zone, NR_FREE_CMA_PAGES) >
-				zone_page_state(zone, NR_FREE_PAGES) / 2);
-	} else {
-		/*
-		 * watermark failed means UNMOVABLE & RECLAIMBLE is not enough
-		 * now, we should use cma first to keep them stay around the
-		 * corresponding watermark
-		 */
-		cma_first = true;
-	}
-	return cma_first;
-}
-#else
-static bool use_cma_first(struct zone *zone, unsigned int order, unsigned int alloc_flags)
-{
-	return false;
-}
-#endif
-
+/* Remove page from the per-cpu list, caller must protect the list */
 static struct page *__rmqueue_pcplist(struct zone *zone, int migratetype,
 			unsigned int alloc_flags,
 			struct per_cpu_pages *pcp,
@@ -3399,7 +3362,7 @@ struct page *rmqueue(struct zone *preferred_zone,
 				trace_mm_page_alloc_zone_locked(page, order, migratetype);
 		}
 
-		if (!page && use_cma_first(zone, order, alloc_flags) &&
+		if (!page && migratetype == MIGRATE_MOVABLE &&
 				gfp_flags & __GFP_CMA)
 			page = __rmqueue_cma(zone, order);
 
@@ -4314,28 +4277,21 @@ static int
 __perform_reclaim(gfp_t gfp_mask, unsigned int order,
 					const struct alloc_context *ac)
 {
-	struct reclaim_state reclaim_state;
 	int progress;
 	unsigned int noreclaim_flag;
-	unsigned long pflags;
 
 	cond_resched();
 
 	/* We now go into synchronous reclaim */
 	cpuset_memory_pressure_bump();
-	psi_memstall_enter(&pflags);
 	fs_reclaim_acquire(gfp_mask);
 	noreclaim_flag = memalloc_noreclaim_save();
-	reclaim_state.reclaimed_slab = 0;
-	current->reclaim_state = &reclaim_state;
 
 	progress = try_to_free_pages(ac->zonelist, order, gfp_mask,
 								ac->nodemask);
 
-	current->reclaim_state = NULL;
 	memalloc_noreclaim_restore(noreclaim_flag);
 	fs_reclaim_release(gfp_mask);
-	psi_memstall_leave(&pflags);
 
 	cond_resched();
 
@@ -4349,11 +4305,13 @@ __alloc_pages_direct_reclaim(gfp_t gfp_mask, unsigned int order,
 		unsigned long *did_some_progress)
 {
 	struct page *page = NULL;
+	unsigned long pflags;
 	bool drained = false;
 
+	psi_memstall_enter(&pflags);
 	*did_some_progress = __perform_reclaim(gfp_mask, order, ac);
 	if (unlikely(!(*did_some_progress)))
-		return NULL;
+		goto out;
 
 retry:
 	page = get_page_from_freelist(gfp_mask, order, alloc_flags, ac);
@@ -4369,6 +4327,8 @@ retry:
 		drained = true;
 		goto retry;
 	}
+out:
+	psi_memstall_leave(&pflags);
 
 	return page;
 }

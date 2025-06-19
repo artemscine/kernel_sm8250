@@ -25,6 +25,8 @@
  * satisfy the overall load at any given moment.
  */
 
+#include <drm/drm_refresh_rate.h>
+
 struct cass_cpu_cand {
 	int cpu;
 	unsigned int exit_lat;
@@ -72,6 +74,30 @@ void cass_cpu_util(struct cass_cpu_cand *c, int this_cpu, bool sync)
 	c->cap = c->cap_max - min(c->hard_util, c->cap_max - 1);
 }
 
+/*
+ * Returns true if @c is a little CPU.
+ */
+static __always_inline
+bool cass_little_cpu(const struct cass_cpu_cand *c)
+{
+	return c->cpu < 4;
+}
+
+/*
+ * Returns true if @c is a CPU with the maximum possible original capacity and
+ * there's only one such CPU in the system (i.e., if @c is the prime CPU).
+ */
+static __always_inline
+bool cass_prime_cpu(const struct cass_cpu_cand *c)
+{
+	/*
+	 * On arm64, the prime CPU is always the last CPU. If it doesn't have
+	 * the same original capacity as the prior CPU, then it is prime.
+	 */
+	return c->cpu == nr_cpu_ids - 1 &&
+	       arch_scale_cpu_capacity(nr_cpu_ids - 2) != SCHED_CAPACITY_SCALE;
+}
+
 /* Returns true if @a is a better CPU than @b */
 static __always_inline
 bool cass_cpu_better(const struct cass_cpu_cand *a,
@@ -97,6 +123,14 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 		     fits_capacity(p_util, b->cap_max)))
 		goto done;
 
+	/* 
+	Prefer the CPU that isn't the slowest one in the system for
+	regular usage and Prefer the CPU that isn't the fastest one otherwise
+	*/
+	if ((msm_panel_fps <= 60) ? (cass_cmp(cass_little_cpu(b), cass_little_cpu(a)))
+		: (cass_cmp(cass_prime_cpu(b), cass_prime_cpu(a))))
+		goto done;
+
 	/* Prefer the CPU with lower relative utilization */
 	if (cass_cmp(b->util, a->util))
 		goto done;
@@ -118,7 +152,7 @@ bool cass_cpu_better(const struct cass_cpu_cand *a,
 		goto done;
 
 	/* Prefer the previous CPU */
-	if (cass_eq(a->cpu, prev_cpu) || !cass_cmp(b->cpu, prev_cpu))
+	if (cass_cmp( (a->cpu == prev_cpu), (b->cpu == prev_cpu) ))
 		goto done;
 
 	/* Prefer the CPU that shares a cache with the previous CPU */
@@ -164,6 +198,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		struct cass_cpu_cand *curr = &cands[cidx];
 		struct cpuidle_state *idle_state;
 		struct rq *rq = cpu_rq(cpu);
+		unsigned long min_cap = 0;
 
 		/* Get the original, maximum _possible_ capacity of this CPU */
 		curr->cap_max = arch_scale_cpu_capacity(cpu);
@@ -177,6 +212,7 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		 * sync wakes, treat the current CPU as idle if @current is the
 		 * only running task.
 		 */
+		curr->cpu = cpu;
 		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
 		    available_idle_cpu(cpu) || sched_idle_cpu(cpu)) {
 			/*
@@ -186,8 +222,10 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 			 * found so far is the prime CPU. Otherwise, prefer idle
 			 * candidates.
 			 */
-			if (!has_idle &&
-			    uc_min <= arch_scale_min_freq_capacity(cpu)) {
+			min_cap = max(arch_scale_min_freq_capacity(cpu), curr->cap_max >> 2);
+			if (!has_idle && uc_min <= min_cap && 
+				((msm_panel_fps > 60) ? (!cass_little_cpu(curr))
+				: (!cass_prime_cpu(curr)))){
 				/* Discard any previous non-idle candidate */
 				best = curr;
 				has_idle = true;
@@ -210,7 +248,6 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		}
 
 		/* Get this CPU's capacity and utilization */
-		curr->cpu = cpu;
 		cass_cpu_util(curr, this_cpu, sync);
 
 		/*
