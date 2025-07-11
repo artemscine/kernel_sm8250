@@ -13,14 +13,41 @@
 
 #include "sched.h"
 
+#include <linux/atomic.h>
 #include <linux/sched/cpufreq.h>
 #include <trace/events/power.h>
 #include <linux/sched/sysctl.h>
 #include <linux/binfmts.h>
 #include <drm/drm_refresh_rate.h>
 
-
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
+
+/* Per-cluster headroom hysteresis */
+#define HEADROOM_STREAK_THRESHOLD 3
+
+/* We have three clusters: little, prime, big */
+#define NR_CLUSTERS 3
+
+/* Combined atomic: 1 bit mode (0=low, 1=high), 15 bits streak */
+static atomic_t headroom_state[NR_CLUSTERS];  // [mode:1][streak:3] (0–7)
+
+enum {
+	CLUSTER_LITTLE = 0,
+	CLUSTER_PRIME  = 1,
+	CLUSTER_BIG    = 2,
+};
+
+/*
+ * cpu_cluster_id - map a cpu to one of CLUSTER_{LITTLE,PRIME,BIG}
+ */
+static inline int cpu_cluster_id(int cpu)
+{
+	if (cpumask_test_cpu(cpu, cpu_lp_mask))
+		return CLUSTER_LITTLE;
+	else if (cpumask_test_cpu(cpu, cpu_prime_mask))
+		return CLUSTER_PRIME;
+	return CLUSTER_BIG;
+}
 
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
@@ -96,29 +123,11 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	if (!cpufreq_this_cpu_can_update(sg_policy->policy))
 		return false;
 
-	if (unlikely(READ_ONCE(sg_policy->limits_changed))) {
-		WRITE_ONCE(sg_policy->limits_changed, false);
+	if (unlikely(sg_policy->limits_changed)) {
+		sg_policy->limits_changed = false;
 		sg_policy->need_freq_update = true;
-
-		/*
-		 * The above limits_changed update must occur before the reads
-		 * of policy limits in cpufreq_driver_resolve_freq() or a policy
-		 * limits update might be missed, so use a memory barrier to
-		 * ensure it.
-		 *
-		 * This pairs with the write memory barrier in sugov_limits().
-		 */
-		smp_mb();
-
-		return true;
-	} else if (sg_policy->need_freq_update) {
-		/* ignore_dl_rate_limit() wants a new frequency to be found. */
 		return true;
 	}
-
-	/* If the last frequency wasn't set yet then we can still amend it */
-	if (sg_policy->work_in_progress)
-		return true;
 
 	/*
 	 * When frequency-invariant utilization tracking is present, there's no
@@ -135,6 +144,20 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 				   unsigned int next_freq)
 {
+	if (sg_policy->need_freq_update) {
+		sg_policy->need_freq_update = false;
+		/*
+		 * The policy limits have changed, but if the return value of
+		 * cpufreq_driver_resolve_freq() after applying the new limits
+		 * is still equal to the previously selected frequency, the
+		 * driver callback need not be invoked unless the driver
+		 * specifically wants that to happen on every update of the
+		 * policy limits.
+		 */
+		if (cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+			goto must_update;
+	}
+
 	/*
 	 * When a frequency update isn't mandatory (!need_freq_update), the rate
 	 * limit is checked again upon frequency reduction because systems with
@@ -146,25 +169,12 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 	 * systems. A check for arch_scale_freq_invariant() is omitted here
 	 * because unconditionally rechecking the rate limit is cheaper.
 	 */
-	if (sg_policy->need_freq_update) {
-		sg_policy->need_freq_update = false;
-		/*
-		 * The policy limits have changed, but if the return value of
-		 * cpufreq_driver_resolve_freq() after applying the new limits
-		 * is still equal to the previously selected frequency, the
-		 * driver callback need not be invoked unless the driver
-		 * specifically wants that to happen on every update of the
-		 * policy limits.
-		 */
-		 if (sg_policy->next_freq == next_freq &&
-		    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
-			return false;
-	} else if (next_freq == sg_policy->next_freq ||
-		 (next_freq < sg_policy->next_freq &&
-		  sugov_should_rate_limit(sg_policy, time))) {
+	if (next_freq == sg_policy->next_freq ||
+	    (next_freq < sg_policy->next_freq &&
+	     sugov_should_rate_limit(sg_policy, time)))
 		return false;
-	}
 
+must_update:
 	sg_policy->next_freq = next_freq;
 	sg_policy->last_freq_update_time = time;
 
@@ -356,20 +366,61 @@ unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 }
 
 static __always_inline
-unsigned long calculate_headroom_high(unsigned long headroom, int cpu, unsigned long util) {
+unsigned long calculate_headroom_high(unsigned long headroom, int cpu, unsigned long util)
+{
+	unsigned long base_boost = util;
+	unsigned long capacity = capacity_orig_of(cpu);
+	unsigned long delta, quad_boost, max_boost, min_util;
+
+	/* Only apply “manual” % boosts when util < 75% */
+	if (util < (capacity * 75) / 100) {
+		if (cpumask_test_cpu(cpu, cpu_lp_mask))
+			base_boost += util * sysctl_boost_lpmask / 100;
+		else if (cpumask_test_cpu(cpu, cpu_prime_mask))
+			base_boost += 0; // no manual boost for prime
+		else
+			base_boost += util * sysctl_boost_bpmask / 100;
+	}
+
+	/* Apply quadratic tapering boost on top */
+	delta      = capacity - util;
+	quad_boost = (delta * delta) / (5 * capacity);
+
+	/* Suppress boosts at very low util */
+	min_util = capacity / 10;
+	if (util < min_util) {
+		quad_boost = quad_boost * util * util 
+					/ (min_util * min_util);
+	}
+
+	/* Cap the quadratic boost to 25% of capacity */
 	if (cpumask_test_cpu(cpu, cpu_prime_mask))
-		return util; // we don't want to boost prime cluster if there is no touchboost
-	return util + (cpumask_test_cpu(cpu, cpu_lp_mask) ? util : (sysctl_headroom_big/2 + util));
+		max_boost = capacity >> 3;  // 12.5% for prime
+	else
+		max_boost = capacity >> 2;  // 25% for little & big
+
+	if (quad_boost > max_boost)
+		quad_boost = max_boost;
+
+	base_boost += quad_boost;
+	if (base_boost > capacity)
+		base_boost = capacity;
+
+	return base_boost;
 }
 
 static __always_inline
 unsigned long calculate_headroom_low(unsigned long headroom, int cpu, unsigned long util, int fps) {
-	if (util <= sysctl_util_low) { // check if util is way too high for decreasing headroom
+	const unsigned int fps_threshold_high = 50;
+	const unsigned int fps_threshold_low = 30;
+	const unsigned int util_low = 300;
+	
+	if (util <= util_low) { // check if util is way too high for decreasing headroom
 		if (cpumask_test_cpu(cpu, cpu_prime_mask))
-			return (util >> 3); // we want to reduce headroom of prime cluster if phone is idling with screen on
+			return (util >> 2); // we want to reduce headroom of prime cluster if phone is idling with screen on
 		else
-			return (fps > sysctl_fps_threshold_high) ? (util - (util >> 1)) :
-			(fps < sysctl_fps_threshold_low) ? (util >> 3) :
+			return (fps > fps_threshold_high) ? (util - (util >> 1)) :
+			(fps <fps_threshold_low) ? (util >> 3) :
 			(util >> 2);
 	} else {
 		return util;
@@ -379,24 +430,61 @@ unsigned long calculate_headroom_low(unsigned long headroom, int cpu, unsigned l
 static __always_inline
 unsigned long apply_dvfs_headroom(int cpu, unsigned long util, unsigned long max_cap)
 {
+	int cluster = cpu_cluster_id(cpu);
 	unsigned long headroom = util;
 	int fps;
 	unsigned int refresh_rate = dsi_panel_get_refresh_rate();
+	bool want_high;
+	int old, new;
+	int mode, streak;
+	bool use_high;
+
 	if (!refresh_rate)
 		refresh_rate = 60;
 
 	fps = msm_panel_fps ?: 30;
 
+	/* Reset streak when util is zero, full, or very low */
+	if (!util || util >= max_cap || util < (max_cap >> 2))
+		atomic_set(&headroom_state[cluster], 0);
+
+	/* Skip headroom entirely for zero or full */
 	if (!util || util >= max_cap)
 		return util;
 
-	if (refresh_rate > 60 && fps > 70)
+	/* Decide whether we "want" high headroom */
+	want_high = (refresh_rate > 60 && fps > 70);
+
+	/* Apply per-cluster hysteresis */
+	if (want_high) {
+		// Set mode=1, streak=0
+		atomic_set(&headroom_state[cluster], 0x8); // 0b1000
+	} else {
+		do {
+			old = atomic_read(&headroom_state[cluster]);
+			mode   = (old & 0x8); // 0b1000
+			streak = (old & 0x7); // 0b0111
+
+			if (!mode) break; // Already low
+
+			streak++;
+			if (streak >= HEADROOM_STREAK_THRESHOLD) {
+				new = 0; // mode=0, streak=0
+			} else {
+				new = 0x8 | (streak & 0x7); // mode=1, streak=0–7
+			}
+		} while (!atomic_try_cmpxchg(&headroom_state[cluster], &old, new));
+	}
+	/* Extract mode from atomic state */
+	use_high = (atomic_read(&headroom_state[cluster]) >> 3) & 0x1;
+
+	/* pick the per-cluster mode */
+	if (use_high)
 		headroom = calculate_headroom_high(headroom, cpu, util);
 	else
 		headroom = calculate_headroom_low(headroom, cpu, util, fps);
 
-	headroom = min(headroom, max_cap);
-	return headroom;
+	return min(headroom, max_cap);
 }
 
 unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
@@ -418,19 +506,13 @@ unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
 
 static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
 {
-    struct rq *rq = cpu_rq(sg_cpu->cpu);
-    unsigned long min, max, util = cpu_util_cfs(rq);
+	struct rq *rq = cpu_rq(sg_cpu->cpu);
+	unsigned long min, max, util = cpu_util_cfs(rq);
 
-    if (util < 512) {
-        util = (util * 105) / 100;
-    } else {
-        util = (util * 115) / 100;
-    }
-
-    util = schedutil_cpu_util(sg_cpu->cpu, util, &min, &max);
-    util = max(util, boost);
-    sg_cpu->bw_min = min;
-    sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
+	util = schedutil_cpu_util(sg_cpu->cpu, util, &min, &max);
+	util = max(util, boost);
+	sg_cpu->bw_min = min;
+	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
 }
 
 /**
@@ -559,7 +641,7 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu, struct sugov_policy *sg_policy)
 {
 	if (cpu_bw_dl(cpu_rq(sg_cpu->cpu)) > sg_cpu->bw_min)
-		sg_policy->need_freq_update = true;
+		sg_policy->limits_changed = true;
 }
 
 static void sugov_update_single(struct update_util_data *hook, u64 time,
@@ -766,7 +848,7 @@ static void sugov_policy_free(struct sugov_policy *sg_policy)
 static int sugov_kthread_create(struct sugov_policy *sg_policy)
 {
 	struct task_struct *thread;
-	struct sched_param param = { .sched_priority = MAX_USER_RT_PRIO / 2 };
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO / 2 };
 	struct cpufreq_policy *policy = sg_policy->policy;
 	int ret;
 
@@ -1002,16 +1084,7 @@ static void sugov_limits(struct cpufreq_policy *policy)
 		raw_spin_unlock_irqrestore(&sg_policy->update_lock, flags);
 	}
 
-	/*
-	 * The limits_changed update below must take place before the updates
-	 * of policy limits in cpufreq_set_policy() or a policy limits update
-	 * might be missed, so use a memory barrier to ensure it.
-	 *
-	 * This pairs with the memory barrier in sugov_should_update_freq().
-	 */
-	smp_wmb();
-
-	WRITE_ONCE(sg_policy->limits_changed, true);
+	sg_policy->limits_changed = true;
 }
 
 static struct cpufreq_governor schedutil_gov = {

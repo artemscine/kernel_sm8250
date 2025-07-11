@@ -64,10 +64,10 @@ static unsigned int normalized_sysctl_sched_base_slice	= 2800000ULL;
 const_debug unsigned int sysctl_sched_migration_cost	= 0UL;
 DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
 
-unsigned int sysctl_fps_threshold_high __read_mostly = 50;
-unsigned int sysctl_fps_threshold_low __read_mostly = 30;
-unsigned int sysctl_headroom_big __read_mostly = 22;
-unsigned int sysctl_util_low __read_mostly = 180;
+unsigned int sysctl_boost_lpmask __read_mostly = 30;
+unsigned int sysctl_boost_bpmask __read_mostly = 15;
+static int zero		= 0;
+static int hundred	= 100;
 
 int sched_thermal_decay_shift;
 static int __init setup_sched_thermal_decay_shift(char *str)
@@ -123,33 +123,23 @@ unsigned int sysctl_sched_cfs_bandwidth_slice		= 5000UL;
 #endif
 
 static struct ctl_table sched_fair_sysctls[] = {
-		{
-    		.procname       = "sched_fps_threshold_high",
-    		.data           = &sysctl_fps_threshold_high,
+    	{
+    		.procname       = "sched_boost_little_cores",
+    		.data           = &sysctl_boost_lpmask,
     		.maxlen         = sizeof(unsigned int),
     		.mode           = 0644,
-    		.proc_handler   = proc_dointvec,
+    		.proc_handler   = proc_dointvec_minmax,
+    		.extra1         = &zero,
+    		.extra2         = &hundred,
     	},
-		{
-    		.procname       = "sched_fps_threshold_low",
-    		.data           = &sysctl_fps_threshold_low,
+    	{
+    		.procname       = "sched_boost_big_cores",
+    		.data           = &sysctl_boost_bpmask,
     		.maxlen         = sizeof(unsigned int),
     		.mode           = 0644,
-    		.proc_handler   = proc_dointvec,
-    	},
-		{
-    		.procname       = "sched_headroom_big",
-    		.data           = &sysctl_headroom_big,
-    		.maxlen         = sizeof(unsigned int),
-    		.mode           = 0644,
-    		.proc_handler   = proc_dointvec,
-    	},
-		{
-    		.procname       = "sched_util_low",
-    		.data           = &sysctl_util_low,
-    		.maxlen         = sizeof(unsigned int),
-    		.mode           = 0644,
-    		.proc_handler   = proc_dointvec,
+    		.proc_handler   = proc_dointvec_minmax,
+    		.extra1         = &zero,
+    		.extra2         = &hundred,
     	},
 	{}
 };
@@ -679,8 +669,6 @@ u64 avg_vruntime(struct cfs_rq *cfs_rq)
 	return cfs_rq->min_vruntime + avg;
 }
 
-static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
-
 /*
  * lag_i = S - s_i = w_i * (V - v_i)
  *
@@ -694,16 +682,17 @@ static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
  * EEVDF gives the following limit for a steady state system:
  *
  *   -r_max < lag < max(r_max, q)
+ *
+ * XXX could add max_slice to the augmented data to track this.
  */
 static void update_entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
-	u64 max_slice = cfs_rq_max_slice(cfs_rq) + TICK_NSEC;
 	s64 vlag, limit;
 
 	SCHED_WARN_ON(!se->on_rq);
 
 	vlag = avg_vruntime(cfs_rq) - se->vruntime;
-	limit = calc_delta_fair(max_slice, se);
+	limit = calc_delta_fair(max_t(u64, 2*se->slice, TICK_NSEC), se);
 
 	se->vlag = clamp(vlag, -limit, limit);
 }
@@ -796,21 +785,6 @@ static inline u64 cfs_rq_min_slice(struct cfs_rq *cfs_rq)
 	return min_slice;
 }
 
-static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq)
-{
-	struct sched_entity *root = __pick_root_entity(cfs_rq);
-	struct sched_entity *curr = cfs_rq->curr;
-	u64 max_slice = 0ULL;
-
-	if (curr && curr->on_rq)
-	max_slice = curr->slice;
-
-	if (root)
-		max_slice = max(max_slice, root->max_slice);
-
-	return max_slice;
-}
-
 static inline bool __entity_less(struct rb_node *a, const struct rb_node *b)
 {
 	return entity_before(__node_2_se(a), __node_2_se(b));
@@ -836,16 +810,6 @@ static inline void __min_slice_update(struct sched_entity *se, struct rb_node *n
 	}
 }
 
-static inline void __max_slice_update(struct sched_entity *se, struct rb_node *node)
-{
-	if (node) {
-		struct sched_entity *rse = __node_2_se(node);
-
-		if (rse->max_slice > se->max_slice)
-			se->max_slice = rse->max_slice;
-	}
-}
-
 /*
  * se->min_vruntime = min(se->vruntime, {left,right}->min_vruntime)
  */
@@ -853,7 +817,6 @@ static inline bool min_vruntime_update(struct sched_entity *se, bool exit)
 {
 	u64 old_min_vruntime = se->min_vruntime;
 	u64 old_min_slice = se->min_slice;
-	u64 old_max_slice = se->max_slice;
 	struct rb_node *node = &se->run_node;
 
 	se->min_vruntime = se->vruntime;
@@ -864,13 +827,8 @@ static inline bool min_vruntime_update(struct sched_entity *se, bool exit)
 	__min_slice_update(se, node->rb_right);
 	__min_slice_update(se, node->rb_left);
 
-	se->max_slice = se->slice;
-	__max_slice_update(se, node->rb_right);
-	__max_slice_update(se, node->rb_left);
-
 	return se->min_vruntime == old_min_vruntime &&
-	       se->min_slice == old_min_slice &&
-	       se->max_slice == old_max_slice;
+	       se->min_slice == old_min_slice;
 }
 
 RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
@@ -884,7 +842,6 @@ static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	avg_vruntime_add(cfs_rq, se);
 	se->min_vruntime = se->vruntime;
 	se->min_slice = se->slice;
-	se->max_slice = se->slice;
 	rb_add_augmented_cached(&se->run_node, &cfs_rq->tasks_timeline,
 				__entity_less, &min_vruntime_cb);
 }
@@ -917,37 +874,23 @@ struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq)
 }
 
 /*
- * HACK, Set the vruntime, up to which the entity can run before picking
- * another one, in vlag, which isn't used until dequeue.
- * In case of run to parity, we use the shortest slice of the enqueued
- * entities.
- * When run to parity is disable we give a minimum quantum to the
- * running entity to ensure progress.
+ * HACK, stash a copy of deadline at the point of pick in vlag,
+ * which isn't used until dequeue.
  */
 static inline void set_protect_slice(struct sched_entity *se)
 {
-	u64 quantum;
-
-	if (sched_feat(RUN_TO_PARITY))
-		quantum = cfs_rq_min_slice(cfs_rq_of(se));
-	else
-		quantum = min(se->slice,(u64)normalized_sysctl_sched_base_slice);
-
-	if (quantum != se->slice)
-		se->vlag = min(se->deadline, se->vruntime + calc_delta_fair(quantum, se));
-	else
-		se->vlag = se->deadline;
+	se->vlag = se->deadline;
 }
 
 static inline bool protect_slice(struct sched_entity *se)
 {
-	return ((s64)(se->vlag - se->vruntime) > 0);
+	return se->vlag == se->deadline;
 }
 
 static inline void cancel_protect_slice(struct sched_entity *se)
 {
 	if (protect_slice(se))
-		se->vlag = se->vruntime;
+		se->vlag = se->deadline + 1;
 }
 
 /*
@@ -986,7 +929,7 @@ static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq)
 	if (curr && (!curr->on_rq || !entity_eligible(cfs_rq, curr)))
 		curr = NULL;
 
-	if (curr && protect_slice(curr))
+	if (sched_feat(RUN_TO_PARITY) && curr && protect_slice(curr))
 		return curr;
 
 	/* Pick the leftmost entity if it's eligible */
@@ -1199,9 +1142,12 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 }
 #endif /* CONFIG_SMP */
 
-static inline bool resched_next_quantum(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+static inline bool did_preempt_short(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 {
-	if (protect_slice(curr))
+	if (!sched_feat(PREEMPT_SHORT))
+		return false;
+
+	if (curr->vlag == curr->deadline)
 		return false;
 
 	return !entity_eligible(cfs_rq, curr);
@@ -1271,7 +1217,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (cfs_rq->nr_running == 1)
 		return;
 
-	if (resched || resched_next_quantum(cfs_rq, curr)) {
+	if (resched || did_preempt_short(cfs_rq, curr)) {
 		resched_curr(rq);
 		clear_buddies(cfs_rq, curr);
 	}
@@ -8156,7 +8102,7 @@ eas_not_ready:
 
 /*
  * select_task_rq_fair: Select target runqueue for the waking task in domains
- * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
+ * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
  *
  * Balances load by selecting the idlest CPU in the idlest group, or under
@@ -8167,15 +8113,17 @@ eas_not_ready:
  * preempt must be disabled.
  */
 static int
-select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
+select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 {
+	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
 	struct sched_domain *tmp, *sd = NULL;
 	int cpu = smp_processor_id();
 	int new_cpu = prev_cpu;
 	int want_affine = 0;
-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+	/* SD_flags and WF_flags share the first nibble */
+	int sd_flag = wake_flags & 0xF;
 
-	if (sd_flag & SD_BALANCE_WAKE) {
+	if (wake_flags & WF_TTWU) {
 		record_wakee(p);
 
                 if (sched_energy_enabled()) {
@@ -8219,9 +8167,8 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
         	new_cpu = prev_cpu;
     	else
         	new_cpu = find_idlest_cpu(sd, p, cpu, prev_cpu, sd_flag);
-	} else if (sd_flag & SD_BALANCE_WAKE) { /* XXX always ? */
+	} else if (wake_flags & WF_TTWU) { /* XXX always ? */
 		/* Fast path */
-
 		new_cpu = (cpu_rq(prev_cpu)->nr_running < 3) ? prev_cpu : select_idle_sibling(p, prev_cpu, new_cpu);
 	}
 	rcu_read_unlock();
