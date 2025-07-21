@@ -517,6 +517,30 @@ mode_valid(struct drm_atomic_state *state)
 	return 0;
 }
 
+static int drm_atomic_check_valid_clones(struct drm_atomic_state *state,
+					 struct drm_crtc *crtc)
+{
+	struct drm_encoder *drm_enc;
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state,
+									  crtc);
+
+	drm_for_each_encoder_mask(drm_enc, crtc->dev, crtc_state->encoder_mask) {
+		if (!drm_enc->possible_clones) {
+			DRM_DEBUG("enc%d possible_clones is 0\n", drm_enc->base.id);
+			continue;
+		}
+
+		if ((crtc_state->encoder_mask & drm_enc->possible_clones) !=
+		    crtc_state->encoder_mask) {
+			DRM_DEBUG("crtc%d failed valid clone check for mask 0x%x\n",
+				  crtc->base.id, crtc_state->encoder_mask);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 /**
  * drm_atomic_helper_check_modeset - validate state object for modeset changes
  * @dev: DRM device
@@ -668,6 +692,10 @@ drm_atomic_helper_check_modeset(struct drm_device *dev,
 			return ret;
 
 		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret != 0)
+			return ret;
+
+		ret = drm_atomic_check_valid_clones(state, crtc);
 		if (ret != 0)
 			return ret;
 	}
@@ -1420,7 +1448,7 @@ void drm_atomic_helper_wait_for_flip_done(struct drm_device *dev,
 		if (!crtc || !commit)
 			continue;
 
-		ret = wait_for_common(&commit->flip_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->flip_done, 10 * HZ);
 		if (ret == 0)
 			DRM_ERROR("[CRTC:%d:%s] flip_done timed out\n",
 				  crtc->base.id, crtc->name);
@@ -2027,14 +2055,16 @@ void drm_atomic_helper_wait_for_dependencies(struct drm_atomic_state *old_state)
 		if (!commit)
 			continue;
 
-		ret = wait_for_common(&commit->hw_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->hw_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[CRTC:%d:%s] hw_done timed out\n",
 				  crtc->base.id, crtc->name);
 
 		/* Currently no support for overwriting flips, hence
 		 * stall for previous one to execute completely. */
-		ret = wait_for_common(&commit->flip_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->flip_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[CRTC:%d:%s] flip_done timed out\n",
 				  crtc->base.id, crtc->name);
@@ -2046,14 +2076,16 @@ void drm_atomic_helper_wait_for_dependencies(struct drm_atomic_state *old_state)
 		if (!commit)
 			continue;
 
-		ret = wait_for_common(&commit->hw_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->hw_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[CONNECTOR:%d:%s] hw_done timed out\n",
 				  conn->base.id, conn->name);
 
 		/* Currently no support for overwriting flips, hence
 		 * stall for previous one to execute completely. */
-		ret = wait_for_common(&commit->flip_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->flip_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[CONNECTOR:%d:%s] flip_done timed out\n",
 				  conn->base.id, conn->name);
@@ -2065,14 +2097,16 @@ void drm_atomic_helper_wait_for_dependencies(struct drm_atomic_state *old_state)
 		if (!commit)
 			continue;
 
-		ret = wait_for_common(&commit->hw_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->hw_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[PLANE:%d:%s] hw_done timed out\n",
 				  plane->base.id, plane->name);
 
 		/* Currently no support for overwriting flips, hence
 		 * stall for previous one to execute completely. */
-		ret = wait_for_common(&commit->flip_done, 10 * HZ, TASK_IDLE);
+		ret = wait_for_completion_timeout(&commit->flip_done,
+						  10*HZ);
 		if (ret == 0)
 			DRM_ERROR("[PLANE:%d:%s] flip_done timed out\n",
 				  plane->base.id, plane->name);
